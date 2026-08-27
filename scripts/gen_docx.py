@@ -29,7 +29,9 @@ MAX_H = 6.3
 
 
 def strip_md_inline(text):
-    """把行内 markdown 拆成 (plain_text, is_bold, is_mono) 片段列表"""
+    """把行内 markdown 拆成 (plain_text, is_bold, is_mono) 片段列表
+    支持：**加粗**、`代码`、[链接](url)（链接只保留显示文字）"""
+    text = re.sub(r'\[([^\]]*)\]\([^)]*\)', r'\1', text)
     tokens = []
     pattern = re.compile(r'(\*\*.+?\*\*|`[^`]+`)')
     pos = 0
@@ -86,7 +88,7 @@ def build_doc(md_path, docx_path, png_dir, title='', subtitle=''):
             run.font.color.rgb = color
         return run
 
-    def add_para(tokens, size=10.5, align=None, space_after=6, east='宋体'):
+    def add_para(tokens, size=10.5, align=None, space_after=6, east='宋体', color=None):
         p = doc.add_paragraph()
         if align is not None:
             p.alignment = align
@@ -97,7 +99,7 @@ def build_doc(md_path, docx_path, png_dir, title='', subtitle=''):
             if mono:
                 add_run(p, t, east='等线', size=size, bold=False, mono=True)
             else:
-                add_run(p, t, east=east, size=size, bold=b or None)
+                add_run(p, t, east=east, size=size, bold=b or None, color=color)
         return p
 
     def add_heading(text, level):
@@ -165,12 +167,9 @@ def build_doc(md_path, docx_path, png_dir, title='', subtitle=''):
         sp = doc.add_paragraph()
         sp.paragraph_format.space_after = Pt(4)
 
-    def add_mermaid_image(idx):
-        png = os.path.join(png_dir, f'mermaid_{idx}.png')
-        if not os.path.exists(png):
-            add_para(f'[图表渲染失败: {idx}]', size=10, color=C_GRAY)
-            return
-        img = Image.open(png)
+    def _add_picture(path):
+        """按 6.3 英寸约束等比嵌入图片（超高按高度缩）"""
+        img = Image.open(path)
         w, h = img.size
         aspect = h / w if w else 1
         target_w = MAX_W
@@ -183,7 +182,27 @@ def build_doc(md_path, docx_path, png_dir, title='', subtitle=''):
         p.paragraph_format.space_before = Pt(6)
         p.paragraph_format.space_after = Pt(6)
         run = p.add_run()
-        run.add_picture(png, width=Inches(target_w), height=Inches(target_h))
+        run.add_picture(path, width=Inches(target_w), height=Inches(target_h))
+
+    def add_mermaid_image(idx):
+        png = os.path.join(png_dir, f'mermaid_{idx}.png')
+        if not os.path.exists(png):
+            add_para(f'[图表渲染失败: {idx}]', size=10, color=C_GRAY)
+            return
+        _add_picture(png)
+
+    def add_inline_image(src, alt=''):
+        """行内图片 ![alt](path)：相对路径基于 md 所在目录解析"""
+        path = src
+        if not os.path.isabs(path):
+            path = os.path.join(os.path.dirname(md_path), src)
+        if not os.path.exists(path):
+            add_para(f'[图片缺失: {alt or src}]', size=10, color=C_GRAY)
+            return
+        try:
+            _add_picture(path)
+        except Exception:
+            add_para(f'[图片无法解析: {alt or src}]', size=10, color=C_GRAY)
 
     # 文档标题
     if title:
@@ -242,6 +261,13 @@ def build_doc(md_path, docx_path, png_dir, title='', subtitle=''):
             i += 1
             continue
 
+        # 行内图片 ![alt](path)
+        m_img = re.fullmatch(r'!\[([^\]]*)\]\(([^)]+)\)', stripped)
+        if m_img:
+            add_inline_image(m_img.group(2), m_img.group(1))
+            i += 1
+            continue
+
         if re.match(r'^\s*[-*]\s+\[.*\]\(#', stripped):
             i += 1
             continue
@@ -291,10 +317,7 @@ def build_doc(md_path, docx_path, png_dir, title='', subtitle=''):
             continue
 
         if stripped.startswith('>'):
-            text = stripped.lstrip('>').strip()
-            if re.match(r'^\*\*版本\*\*|^\*\*日期\*\*|^\*\*状态\*\*|^\*\*主要变更\*\*', text):
-                i += 1
-                continue
+            text = re.sub(r'^>\s?', '', raw.lstrip()).strip()
             p = doc.add_paragraph()
             p.paragraph_format.left_indent = Inches(0.3)
             p.paragraph_format.space_after = Pt(6)
@@ -303,22 +326,32 @@ def build_doc(md_path, docx_path, png_dir, title='', subtitle=''):
             i += 1
             continue
 
-        m = re.match(r'^\s*[-*]\s+(.*)', stripped)
+        # 无序列表（支持嵌套：按缩进层级用 List Bullet 1/2/3）
+        m = re.match(r'^(\s*)([-*+])\s+(.*)', raw)
         if m:
-            text = m.group(1)
-            p = doc.add_paragraph(style='List Bullet')
+            indent = len(m.group(1).expandtabs(2))
+            level = min(indent // 2 + 1, 3)
+            text = m.group(3)
+            style = 'List Bullet' if level == 1 else f'List Bullet {level}'
+            try:
+                p = doc.add_paragraph(style=style)
+            except KeyError:
+                p = doc.add_paragraph(style='List Bullet')
+                p.paragraph_format.left_indent = Inches(0.25 * level)
             p.paragraph_format.space_after = Pt(3)
             for tok, b, mono in strip_md_inline(text):
                 add_run(p, tok, east='宋体', size=10.5, bold=b or None, mono=mono)
             i += 1
             continue
 
-        m = re.match(r'^\s*(\d+)\.\s+(.*)', stripped)
+        # 有序列表（嵌套时数字加缩进）
+        m = re.match(r'^(\s*)(\d+)\.\s+(.*)', raw)
         if m:
-            num = m.group(1)
-            text = m.group(2)
+            indent = len(m.group(1).expandtabs(2))
+            level = min(indent // 2 + 1, 3)
+            num, text = m.group(2), m.group(3)
             p = doc.add_paragraph()
-            p.paragraph_format.left_indent = Inches(0.4)
+            p.paragraph_format.left_indent = Inches(0.4 + 0.3 * (level - 1))
             p.paragraph_format.space_after = Pt(3)
             add_run(p, num + '. ', east='宋体', size=10.5, bold=True)
             for tok, b, mono in strip_md_inline(text):
