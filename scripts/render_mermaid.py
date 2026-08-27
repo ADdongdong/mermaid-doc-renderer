@@ -5,9 +5,17 @@
 支持分辨率：--scale 倍率，或 --width 目标像素宽度
 
 渲染管线（完全离线，验证可靠）：
-  1. headless Chromium 加载 HTML（内嵌本地 mermaid.min.js），mermaid 渲染成 SVG
-  2. PNG/WebP/JPG/PDF：--screenshot 直接截取高清位图（DSF 缩放），PIL 裁剪白边
-  3. SVG：--dump-dom 读回 DOM 提取 <svg> 矢量源码
+  1. headless Chromium 加载 HTML（内嵌本地 mermaid.min.js），
+     mermaid 渲染完成后在 document.title 写入状态标记：
+       MMD_READY = 成功    MMD_ERROR:<消息> = mermaid 语法错误
+  2. 第一遍 --dump-dom 读回 DOM：校验渲染状态；SVG 格式直接提取 <svg> 矢量源码
+  3. 位图格式（PNG/WebP/JPG/PDF）：第二遍 --screenshot 截取高清位图（DSF 缩放），
+     PIL 快速裁剪白边，再按需转格式
+
+健壮性设计：
+  - 渲染失败（语法错误/空白图）会明确报错并跳过该块，不再静默输出坏图
+  - 临时 HTML 写入系统临时目录（tempfile），互不冲突，用后即删
+  - 白边裁剪用 PIL ImageChops.getbbox()，大图也是毫秒级
 
 为什么不用 cairosvg 转 SVG？
   mermaid 生成的 SVG 含复杂 CSS/foreignObject，cairosvg 解析常报 mismatched tag，
@@ -24,43 +32,73 @@
 
 依赖：
   - Python：Pillow（无 cairosvg 需求）
-  - headless Chromium（本机 Playwright 自带 chromium_headless_shell-1148）
-  - mermaid.min.js v10（离线，本 skill 自带 assets/mermaid.min.js）
+  - headless Chromium（自动探测 Playwright 的 chromium_headless_shell 或系统 Chrome）
+  - mermaid.min.js v10+（离线，本 skill 自带 assets/mermaid.min.js）
 """
-import os, sys, re, subprocess, argparse, glob, io, html, json
+import os, sys, re, subprocess, argparse, glob, json, tempfile, shutil
 
 # ====== 自动探测环境常量 ======
 SKILL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def find_mermaid_js():
-    cands = [
-        os.path.join(SKILL_DIR, 'assets', 'mermaid.min.js'),
-        r'C:\Users\10355\mmdc_work\mermaid.min.js',
-    ]
-    for c in cands:
-        if os.path.exists(c):
-            return c
-    return cands[0]
+    """优先 skill 自带的离线库；找不到时给出可操作的提示"""
+    bundled = os.path.join(SKILL_DIR, 'assets', 'mermaid.min.js')
+    if os.path.exists(bundled):
+        return bundled
+    return None
 
 
 def find_headless_shell():
-    patterns = [
-        os.path.join(os.environ.get('LOCALAPPDATA', r'C:\Users\10355\AppData\Local'),
-                     'ms-playwright', 'chromium_headless_shell-*', 'chrome-win', 'headless_shell.exe'),
-        r'C:\Program Files\Google\Chrome\Application\chrome.exe',
-        r'C:\Program Files (x86)\Google\Chrome\Application\chrome.exe',
-    ]
-    for pat in patterns:
-        hits = glob.glob(pat)
-        if hits:
-            return hits[0]
-    return patterns[0]
+    """跨平台探测 headless 浏览器：
+    1) Playwright 安装的 chromium_headless_shell（任意版本号）
+    2) Playwright 的 chromium 完整版 chrome
+    3) 系统已装的 Chrome / Edge
+    """
+    home = os.path.expanduser('~')
+    local = os.environ.get('LOCALAPPDATA') or os.path.join(home, 'AppData', 'Local')
+    candidates = []
+
+    pw_dirs = [os.path.join(local, 'ms-playwright'),
+               os.path.join(home, '.cache', 'ms-playwright')]
+    for root in pw_dirs:
+        if not os.path.isdir(root):
+            continue
+        for sub in sorted(glob.glob(os.path.join(root, 'chromium*')), reverse=True):
+            for exe in (('chrome-win', 'headless_shell.exe'),
+                        ('chrome-win', 'chrome.exe'),
+                        ('chrome-win64', 'headless_shell.exe'),
+                        ('chrome-win64', 'chrome.exe'),
+                        ('chrome-linux', 'headless_shell'),
+                        ('chrome-linux', 'chrome'),
+                        ('chrome-mac', 'Chromium.app', 'Contents', 'MacOS', 'Chromium')):
+                p = os.path.join(sub, *exe)
+                if os.path.exists(p):
+                    candidates.append(p)
+
+    import platform
+    if platform.system() == 'Windows':
+        pf = os.environ.get('ProgramFiles', r'C:\Program Files')
+        pf86 = os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)')
+        for base in (pf, pf86):
+            for rel in (r'Google\Chrome\Application\chrome.exe',
+                        r'Microsoft\Edge\Application\msedge.exe'):
+                candidates.append(os.path.join(base, rel))
+    elif platform.system() == 'Darwin':
+        candidates += ['/Applications/Google Chrome.app/Contents/MacOS/Google Chrome']
+    else:
+        candidates += ['/usr/bin/google-chrome', '/usr/bin/chromium-browser',
+                       '/usr/bin/chromium']
+
+    for c in candidates:
+        if c and os.path.exists(c):
+            return c
+    return None
 
 
 MERMAID_JS = os.environ.get('MERMAID_JS') or find_mermaid_js()
 SHELL = os.environ.get('HEADLESS_SHELL') or find_headless_shell()
-DEFAULT_OUT = os.path.join(SKILL_DIR, 'render_out')
+DEFAULT_OUT = os.path.join(os.getcwd(), 'render_out')
 
 
 def extract_mermaid_blocks(md_text):
@@ -81,114 +119,102 @@ def extract_mermaid_blocks(md_text):
     return blocks
 
 
-def make_html(mermaid_code):
-    mermaid_js_url = 'file:///' + MERMAID_JS.replace('\\', '/')
+def make_html(mermaid_code, mermaid_js_path):
+    """生成渲染页：成功写 title=MMD_READY，失败写 title=MMD_ERROR 并把错误显示在页面里"""
+    mermaid_js_url = 'file:///' + mermaid_js_path.replace('\\', '/')
     code_json = json.dumps(mermaid_code)
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <script src="{mermaid_js_url}"></script>
 <style>
   html,body {{ margin:0; padding:0; background:#fff; }}
-  .mermaid {{ padding:16px; }}
+  .mermaid {{ padding:16px; font-size:16px; }}
 </style>
 </head><body>
 <div class="mermaid" id="mm"></div>
 <script>
   var code = {code_json};
   document.getElementById('mm').textContent = code;
-  mermaid.initialize({{ startOnLoad:true, theme:'default', securityLevel:'loose' }});
-  setTimeout(function(){{
-    try {{ var s=document.querySelector('#mm svg'); if(s) document.title='MMD_READY'; }} catch(e){{}}
-  }}, 3000);
+    try {{
+    mermaid.initialize({{ startOnLoad:false, theme:'default', securityLevel:'loose',
+                          suppressErrorRendering:true }});
+    mermaid.run({{ querySelector:'#mm' }}).then(function(){{
+      document.title = 'MMD_READY';
+    }}).catch(function(e){{
+      document.title = 'MMD_ERROR';
+      document.getElementById('mm').textContent = String(e && e.message || e);
+      document.getElementById('mm').style.color = '#c00';
+    }});
+  }} catch(e) {{
+    document.title = 'MMD_ERROR';
+    document.getElementById('mm').textContent = String(e && e.message || e);
+  }}
 </script>
 </body></html>"""
 
 
-def render_png_screenshot(mermaid_code, out_path, scale=2, view_w=1800, view_h=1400):
-    """headless_shell 截图 → PNG（DSF 缩放），验证可靠"""
-    html_path = os.path.join(os.path.dirname(out_path) or '.', f'_mm_tmp.html')
-    with open(html_path, 'w', encoding='utf-8') as f:
-        f.write(make_html(mermaid_code))
-    cmd = [SHELL, '--headless', '--disable-gpu', '--no-sandbox',
-           '--hide-scrollbars', f'--force-device-scale-factor={scale}',
-           f'--window-size={view_w},{view_h}', '--virtual-time-budget=10000',
-           f'--screenshot={out_path}',
-           f'file:///{html_path.replace(chr(92), "/")}']
-    try:
-        subprocess.run(cmd, capture_output=True, timeout=60)
-    except Exception as e:
-        print(f'  render error: {e}')
-        return None
-    if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
-        print('  no png produced')
-        return None
-    return out_path
+def run_chromium(html_path, extra_args):
+    cmd = [SHELL,
+           '--headless', '--disable-gpu', '--no-sandbox',
+           '--hide-scrollbars', '--force-device-scale-factor=1',
+           '--window-size=1800,1400', '--virtual-time-budget=10000',
+           ] + extra_args + ['file:///' + html_path.replace('\\', '/')]
+    return subprocess.run(cmd, capture_output=True, timeout=90)
 
 
-def render_svg_dump(mermaid_code, out_path, scale=2, view_w=1800, view_h=1400):
-    """dump-dom 提取 SVG 矢量源码"""
-    html_path = os.path.join(os.path.dirname(out_path) or '.', f'_mm_tmp.html')
-    with open(html_path, 'w', encoding='utf-8') as f:
-        f.write(make_html(mermaid_code))
-    cmd = [SHELL, '--headless', '--disable-gpu', '--no-sandbox',
-           '--hide-scrollbars', f'--force-device-scale-factor={scale}',
-           f'--window-size={view_w},{view_h}', '--virtual-time-budget=10000',
-           '--dump-dom', f'file:///{html_path.replace(chr(92), "/")}']
-    try:
-        r = subprocess.run(cmd, capture_output=True, timeout=60)
-    except Exception as e:
-        print(f'  render error: {e}')
-        return None
-    dom = r.stdout.decode('utf-8', errors='replace')
-    start = dom.find('<svg')
-    if start == -1:
-        print('  no svg found in dom')
-        return None
-    end = dom.rfind('</svg>')
-    if end == -1:
-        print('  svg incomplete')
-        return None
-    svg_text = dom[start:end + len('</svg>')]
-    with open(out_path, 'w', encoding='utf-8') as f:
-        f.write(svg_text)
-    return out_path
+def check_status_and_svg(dom):
+    """从 DOM 的 <title> 实际运行时值判断渲染状态（注意：dump-dom 会包含
+    内联 script 源码，裸搜 'MMD_READY' 会误命中 JS 字面量，必须用 <title> 标签）"""
+    m_title = re.search(r'<title[^>]*>([^<]*)</title>', dom)
+    title = (m_title.group(1) if m_title else '').strip()
+    if title == 'MMD_READY':
+        # 兜底：旧版 mermaid 不支持 suppressErrorRendering，会把错误画成横幅图
+        if re.search(r'[Ss]yntax\s+error', dom):
+            status, err = 'error', 'mermaid 语法/运行错误: Syntax error（渲染出错误横幅图）'
+        else:
+            status, err = 'ok', ''
+    elif title == 'MMD_ERROR':
+        m = re.search(r'<div class="mermaid"[^>]*>([\s\S]*?)</div>', dom)
+        err = html_unescape(re.sub(r'<[^>]+>', '', m.group(1))).strip()[:200] if m else '未知错误'
+        status, err = 'error', f'mermaid 语法/运行错误: {err}'
+    else:
+        status, err = 'timeout', '渲染超时或未产生结果（可尝试增大 --virtual-time-budget）'
+    svg = None
+    if status == 'ok':
+        start = dom.find('<svg')
+        end = dom.rfind('</svg>') if start != -1 else -1
+        if start != -1 and end != -1:
+            svg = dom[start:end + len('</svg>')]
+    return status, err, svg
+
+
+def html_unescape(s):
+    for a, b in (('&lt;', '<'), ('&gt;', '>'), ('&amp;', '&'), ('&quot;', '"'), ('&#39;', "'")):
+        s = s.replace(a, b)
+    return s
 
 
 def trim_whitespace(path):
-    """裁剪图片四周纯白边"""
-    from PIL import Image
+    """快速裁掉四周白边：ImageChops 差值 + getbbox（毫秒级，替代逐像素扫描）"""
+    from PIL import Image, ImageChops
     img = Image.open(path).convert('RGB')
-    px = img.load()
-    w, h = img.size
-    bg = (255, 255, 255)
-
-    def is_bg(x, y):
-        r, g, b = px[x, y]
-        return r > 250 and g > 250 and b > 250
-
-    top = 0
-    while top < h:
-        if not all(is_bg(x, top) for x in range(w)):
-            break
-        top += 1
-    bottom = h - 1
-    while bottom > top:
-        if not all(is_bg(x, bottom) for x in range(w)):
-            break
-        bottom -= 1
-    left = 0
-    while left < w:
-        if not all(is_bg(left, y) for y in range(top, bottom + 1)):
-            break
-        left += 1
-    right = w - 1
-    while right > left:
-        if not all(is_bg(right, y) for y in range(top, bottom + 1)):
-            break
-        right -= 1
-    img = img.crop((left, top, right + 1, bottom + 1))
-    img.save(path)
+    bg = Image.new('RGB', img.size, (255, 255, 255))
+    diff = ImageChops.difference(img, bg).convert('L')
+    # 容忍接近白的抗锯齿像素（亮度差 <=8 视为背景）
+    diff = diff.point(lambda x: 0 if x <= 8 else x)
+    bbox = diff.getbbox()
+    if bbox and (bbox[2] - bbox[0] > 4) and (bbox[3] - bbox[1] > 4):
+        img.crop(bbox).save(path)
+        return Image.open(path).size
     return img.size
+
+
+def is_blank_png(path):
+    """内容几乎全白 → 判定渲染失败兜底检查"""
+    from PIL import Image, ImageChops
+    img = Image.open(path).convert('L')
+    bg = Image.new('L', img.size, 255)
+    return ImageChops.difference(img, bg).getbbox() is None
 
 
 def convert_png_to(out_path, fmt, width=None):
@@ -207,59 +233,96 @@ def convert_png_to(out_path, fmt, width=None):
     return target
 
 
-def render_one(mermaid_code, idx, out_dir, fmt='png', scale=2, width=None, trim=True, work_dir=None):
-    work_dir = work_dir or out_dir
+def render_one(mermaid_code, idx, out_dir, fmt='png', scale=2, width=None, trim=True,
+               virtual_time_budget=10000):
     os.makedirs(out_dir, exist_ok=True)
-    os.makedirs(work_dir, exist_ok=True)
 
-    png_path = os.path.join(work_dir, f'mermaid_{idx}.png')
-    svg_path = os.path.join(work_dir, f'mermaid_{idx}.svg')
+    # ---- 临时 HTML：系统临时目录、唯一文件名、用后即删（避免并行冲突和残留）----
+    tmp_dir = tempfile.mkdtemp(prefix='mmdr_')
+    html_path = os.path.join(tmp_dir, 'render.html')
+    with open(html_path, 'w', encoding='utf-8') as f:
+        f.write(make_html(mermaid_code, MERMAID_JS))
 
-    if fmt == 'svg':
-        res = render_svg_dump(mermaid_code, svg_path, scale=scale)
-        if not res:
+    def _cleanup():
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    try:
+        global VIRTUAL_TIME_BUDGET
+        budget_ms = virtual_time_budget or VIRTUAL_TIME_BUDGET
+
+        # ---- 第一遍：dump-dom 校验渲染状态（SVG 在此一并提取）----
+        try:
+            r = run_chromium(html_path, [
+                f'--virtual-time-budget={budget_ms}', '--dump-dom'])
+            dom = r.stdout.decode('utf-8', errors='replace')
+        except Exception as e:
+            print(f'  [{idx}] 渲染失败: {e}')
             return None
-        final = os.path.join(out_dir, f'mermaid_{idx}.svg')
-        os.replace(svg_path, final)
-        print(f'  [{idx}] -> {os.path.basename(final)} size=vector')
-        return final
+        status, err, svg = check_status_and_svg(dom)
+        if status == 'error':
+            print(f'  [{idx}] {err}')
+            return None
+        if status == 'timeout':
+            print(f'  [{idx}] {err}')
+            return None
 
-    # 默认走截图路径（png/webp/jpg/pdf 都先出 PNG）
-    res = render_png_screenshot(mermaid_code, png_path, scale=scale)
-    if not res:
-        return None
-    if trim:
-        trim_whitespace(png_path)
+        name_base = f'mermaid_{idx}'
 
-    if fmt == 'png':
-        if work_dir != out_dir:
-            final = os.path.join(out_dir, f'mermaid_{idx}.png')
-            os.replace(png_path, final)
-            out_path = final
-        else:
-            out_path = png_path
-        if width:
-            from PIL import Image
-            img = Image.open(out_path)
-            h = int(img.height * width / img.width)
-            img = img.resize((width, h), Image.LANCZOS)
-            img.save(out_path)
+        if fmt == 'svg':
+            if not svg:
+                print(f'  [{idx}] DOM 中未找到 SVG 矢量源码')
+                return None
+            final = os.path.join(out_dir, name_base + '.svg')
+            with open(final, 'w', encoding='utf-8') as f:
+                f.write(svg)
+            print(f'  [{idx}] -> {name_base}.svg size=vector')
+            return final
+
+        # ---- 第二遍：高清位图截图（DSF 缩放，放大窗口确保图不被截断）----
+        png_path = os.path.join(tmp_dir, name_base + '.png')
+        try:
+            run_chromium(html_path, [
+                f'--virtual-time-budget={budget_ms}',
+                f'--force-device-scale-factor={scale}',
+                f'--screenshot={png_path}'])
+        except Exception as e:
+            print(f'  [{idx}] 截图失败: {e}')
+            return None
+        if not os.path.exists(png_path) or os.path.getsize(png_path) == 0:
+            print(f'  [{idx}] 截图未产出文件')
+            return None
+        if trim:
+            size = trim_whitespace(png_path)
+            if size[0] <= 6 or size[1] <= 6:
+                print(f'  [{idx}] 渲染内容为空（疑似语法问题被 mermaid 兜底绘制为空白）')
+                return None
+
+        ext = {'jpeg': 'jpg'}.get(fmt, fmt)
+        target = png_path
+        if fmt != 'png':
+            target = convert_png_to(png_path, fmt, width=None)
+        final = os.path.join(out_dir, name_base + '.' + ext)
+        shutil.move(target, final)
+
         from PIL import Image
         try:
-            sz = Image.open(out_path).size
+            sz = Image.open(final).size
         except Exception:
             sz = 'ok'
-        print(f'  [{idx}] -> {os.path.basename(out_path)} size={sz}')
-        return out_path
+        if width:
+            from PIL import Image as I2
+            img = I2.open(final)
+            h = int(img.height * width / img.width)
+            img = img.resize((width, h), I2.LANCZOS)
+            img.save(final)
+            sz = (width, h)
+        print(f'  [{idx}] -> {os.path.basename(final)} size={sz}')
+        return final
+    finally:
+        _cleanup()
 
-    # webp/jpg/pdf
-    target = convert_png_to(png_path, fmt, width=width)
-    if work_dir != out_dir:
-        final = os.path.join(out_dir, os.path.basename(target))
-        os.replace(target, final)
-        target = final
-    print(f'  [{idx}] -> {os.path.basename(target)}')
-    return target
+
+VIRTUAL_TIME_BUDGET = 10000
 
 
 def main():
@@ -267,35 +330,48 @@ def main():
     ap.add_argument('md_path', nargs='?', help='markdown 文件路径（含 mermaid 块）')
     ap.add_argument('--code', help='直接渲染这段 mermaid 源码（优先级最高）')
     ap.add_argument('--out', default=DEFAULT_OUT, help='输出目录')
-    ap.add_argument('--work', help='临时工作目录（默认=out）')
     ap.add_argument('--format', default='png', choices=['png', 'svg', 'webp', 'pdf', 'jpg'],
                     help='输出格式')
     ap.add_argument('--scale', type=float, default=2, help='分辨率倍率（默认2）')
     ap.add_argument('--width', type=int, default=None, help='目标像素宽度（指定后 scale 失效）')
     ap.add_argument('--no-trim', action='store_true', help='不裁剪白边')
+    ap.add_argument('--virtual-time-budget', type=int, default=None,
+                    help='headless 渲染等待毫秒数（默认10000，复杂图可增大）')
     ap.add_argument('--mermaid-js', default=None, help='自定义 mermaid.min.js 路径')
     ap.add_argument('--shell', default=None, help='自定义 headless Chromium 路径')
     args = ap.parse_args()
 
-    global MERMAID_JS, SHELL
+    global MERMAID_JS, SHELL, VIRTUAL_TIME_BUDGET
     if args.mermaid_js:
         MERMAID_JS = args.mermaid_js
     if args.shell:
         SHELL = args.shell
+    if args.virtual_time_budget:
+        VIRTUAL_TIME_BUDGET = args.virtual_time_budget
 
-    if not os.path.exists(MERMAID_JS):
-        print(f'找不到 mermaid.min.js：{MERMAID_JS}')
-        sys.exit(1)
-    if not os.path.exists(SHELL):
-        print(f'找不到 headless Chromium：{SHELL}')
+    problems = []
+    if not MERMAID_JS or not os.path.exists(MERMAID_JS):
+        problems.append(
+            f'找不到 mermaid.min.js\n'
+            f'  预期位置: {SKILL_DIR}\\assets\\mermaid.min.js\n'
+            f'  可从 https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js 下载放入 assets/，'
+            f'或用 --mermaid-js 指定路径')
+    if not SHELL or not os.path.exists(SHELL):
+        problems.append(
+            f'找不到 headless Chromium\n'
+            f'  已依次探测: Playwright 缓存目录、系统 Chrome / Edge\n'
+            f'  可执行 `pip install playwright && playwright install chromium` 后重试，'
+            f'或用 --shell 指定浏览器路径')
+    if problems:
+        print('\n'.join(problems))
         sys.exit(1)
 
     out_dir = args.out
-    work_dir = args.work or out_dir
 
     if args.code:
-        render_one(args.code, 'single', out_dir, fmt=args.format,
-                   scale=args.scale, width=args.width, trim=not args.no_trim, work_dir=work_dir)
+        render_one(args.code, 'single', out_dir, fmt=args.format, scale=args.scale,
+                   width=args.width, trim=not args.no_trim,
+                   virtual_time_budget=args.virtual_time_budget)
         print('DONE')
         return
 
@@ -306,11 +382,16 @@ def main():
         md = f.read()
     blocks = extract_mermaid_blocks(md)
     print(f'找到 {len(blocks)} 个 mermaid 块')
+    fail = 0
     for i, b in enumerate(blocks):
         print(f'== 块 {i}: {b.splitlines()[0][:40]}')
-        render_one(b, i, out_dir, fmt=args.format, scale=args.scale,
-                   width=args.width, trim=not args.no_trim, work_dir=work_dir)
-    print('DONE')
+        res = render_one(b, i, out_dir, fmt=args.format, scale=args.scale,
+                         width=args.width, trim=not args.no_trim,
+                         virtual_time_budget=args.virtual_time_budget)
+        if not res:
+            fail += 1
+    print('DONE', f'(失败 {fail}/{len(blocks)})' if fail else '')
+    sys.exit(1 if fail else 0)
 
 
 if __name__ == '__main__':
